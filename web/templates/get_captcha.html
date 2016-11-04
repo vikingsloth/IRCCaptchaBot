@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block pagebody %}
+<font color=red size=5>STOP!<br></font>
+Solve this captcha to prove you're a human and your host will be granted an<br>
+exception. Your client will be voiced so you can continue to chat during a<br>
+security lockdown.
+<form action="/" method="post">
+    <fieldset>
+        <legend>IRC Captcha Form</legend>
+        <input type="hidden" name="key" value="{{ escape(key) }}">
+        <div class="g-recaptcha" data-sitekey="{{ escape(site_key) }}"></div>
+        <script type="text/javascript" src="https://www.google.com/recaptcha/api.js?hl=python"></script>
+        <p><input type="submit" value="Submit" /></p>
+    </fieldset>
+</form>
+</body>
+</html>
+{% end %}

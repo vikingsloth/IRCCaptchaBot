@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block pagebody %}
+    {% if captcha_success is True %}
+        <h1>Access Granted</h1>
+        Your host has now been granted an exception. You will receive your voice shortly
+    {% else %}
+        <h1>Failed!</h1>
+        Click the link again to retry
+    {% end %}
+</form>
+</body>
+</html>
+{% end %}
