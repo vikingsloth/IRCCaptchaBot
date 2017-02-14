@@ -118,7 +118,7 @@ settings = {
     "cloudflare": False
 }
 
-if __name__ == "__main__":
+def main():
     LOG = logging.getLogger('captchabot-web')
     LOG.setLevel(logging.DEBUG)
     logging.basicConfig(level=logging.DEBUG)
@@ -144,3 +144,6 @@ if __name__ == "__main__":
     server.start(0)
     loop = ioloop.IOLoop.current()
     loop.start()
+
+if __name__ == "__main__":
+    main()
