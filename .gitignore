@@ -1,3 +1,5 @@
 captchabot-irc.cfg
 captchabot-web.cfg
 geoip/*
+*.pyc
+*.swp
