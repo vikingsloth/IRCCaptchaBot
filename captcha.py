@@ -1,7 +1,7 @@
 import logging
 import MySQLdb
 
-class CaptchaBotDB(object):
+class CaptchaDB(object):
 
     def __init__(self, host, user, passwd, db_name):
         self.user = user
