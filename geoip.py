@@ -51,7 +51,6 @@ class GeoIP(object):
                 cidr = cidr.rstrip()
                 match = re.match("\d+\.\d+\.\d+\.\d+/\d+$", cidr)
                 if match:
-                    LOG.info("Adding CIDR %s to DB", cidr)
                     rnode = newtree.add(cidr)
                     rnode.data["hits"] = 0
                     rnode.data["cc"] = country_code

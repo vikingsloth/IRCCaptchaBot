@@ -276,8 +276,6 @@ class KABASBot(SingleServerIRCBot):
                 return
             self.settings.chanconfig[channame][param] = value.upper()
             c.privmsg(reply, "set %s %s = %s" % (channame, param, value))
-            else:
-                c.privmsg(reply, "Error, unknown level %s" % seclevel)
         elif cmd == "join":
             if len(argv) < 3:
                 return
@@ -400,12 +398,13 @@ if __name__ == '__main__':
     ROOTLOG = logging.getLogger()
     ROOTLOG.addHandler(handler)
 
-    if settings["ssl"]:
+    settings = KABASConfig("kabasbot-irc.cfg")
+
+    if settings.ssl:
         wrapper = ssl.wrap_socket
     else:
         wrapper = connection.identity
 
-    settings = KABASConfig("kabasbot-irc.cfg")
     bot = KABASBot(
         settings = settings,
         connect_factory = connection.Factory(
