@@ -12,26 +12,7 @@ import ssl
 import re
 
 from captcha import CaptchaDB
-
-def hashkey(ident_host):
-    h = md5.new(ident_host)
-    return h.hexdigest()
-
-def captcha_url(user_key):
-    return settings["captcha_url"] + "/?key=" + user_key
-
-def is_valid_ip(ip):
-    if ip.count('.') == 3:
-        try:
-            socket.inet_pton(socket.AF_INET, ip)
-        except socket.error:
-            return False
-    else:
-        try:
-            socket.inet_pton(socket.AF_INET6, ip)
-        except socket.error:
-            return False
-    return True
+from geoip import GeoIP
 
 class UserInfo(object):
 
@@ -46,23 +27,85 @@ class UserInfo(object):
     def set_ip(self, ip):
         self.ip = ip
 
+class KABASConfig(object):
+    DEFAULTS = {
+        'bindaddr': '0.0.0.0',
+        'captcha_url': None,
+        'chancontrol': None,
+        'channels': {},
+        'password': None,
+        'db_host': None,
+        'db_name': None,
+        'db_pass': None,
+        'db_user': None,
+        'ipv6': False,
+        'msgcontrol': False,
+        'nickname': None,
+        'servers': [],
+        'ssl': False,
+        'users': [],
+        'banned_countries': []
+    }
+
+    def __init__(self, filename = None, settings = None):
+        if filename:
+            settings = json.load(open(filename, 'r'))
+        self.init_from_dict(settings)
+        LOG.info("Loaded settings")
+
+    def init_from_dict(self, settings):
+        s = self.DEFAULTS
+        s.update(settings)
+        self.add_channels(s["channels"])
+        self.bindaddr = s["bindaddr"]
+        self.captcha_url = s["captcha_url"]
+        self.chancontrol = s["chancontrol"]
+        self.password = s["chancontrol"]
+        self.db_host = s["db_host"]
+        self.db_name = s["db_name"]
+        self.db_pass = s["db_pass"]
+        self.db_user = s["db_user"]
+        self.ipv6 = s["ipv6"]
+        self.msgcontrol = s["msgcontrol"]
+        self.nickname = s["nickname"]
+        self.servers = s["servers"]
+        self.ssl = s["ssl"]
+        self.users = s["users"]
+        self.banned_countries = s["banned_countries"]
+
+    def add_channel(self, name, captcha = "OFF", geoban = "OFF",
+                    autovoice = "OFF"):
+        config = {
+            "captcha": captcha.upper(),
+            "geoban": geoban.upper(),
+            "autovoice": autovoice.upper()
+        }
+        self.chanconfig[name] = config
+
+    def add_channels(self, chanconfig):
+        for name,config in chanconfig.iteritems():
+            self.add_channel(name, **config)
+
+
 class KABASBot(SingleServerIRCBot):
 
-    def __init__(self, server_list, nickname, chanlist, **connect_params):
+    def __init__(self, settings, **connect_params):
+        self.settings = settings
+        server_list = settings.servers
+        nickname = settings.nickname
         super(KABASBot, self).__init__(
             server_list, nickname, "KABAS Bot", **connect_params)
-        self.chanlist = chanlist
         self.db = CaptchaDB(
-                settings["db_host"],
-                settings["db_user"],
-                settings["db_pass"],
-                settings["db_name"])
+                settings.db_host,
+                settings.db_user,
+                settings.db_pass,
+                settings.db_name)
         self.db.connect()
-        self.seclevel = settings["seclevel"]
         self.reactor.execute_every(2, self.periodic_callback)
         self.reactor.execute_every(10, self.keepnick)
-        self.mynick = nickname
-        self.orignick = nickname
+        self.mynick = settings.nickname
+        self.orignick = settings.nickname
+        self.geodb = GeoIP()
         self.initialized = False
 
     def check_solved_captchas(self):
@@ -77,6 +120,33 @@ class KABASBot(SingleServerIRCBot):
     def periodic_callback(self):
         if self.initialized:
             self.check_solved_captchas()
+
+    #### Utility functions
+    def chan_is(self, channame, key, value):
+        if not channame in self.settings.chanconfig:
+            return False
+        chanconfig = self.settings.chanconfig[channame]
+        if not key in chanconfig:
+            return False
+        state = chanconfig[key]
+        # state is already upper()
+        if state == value.upper():
+            return True
+        else:
+            return False
+
+    def chan_is_autovoice(self, channame):
+        return self.chan_is(channame, "autovoice", "ON")
+
+    def chan_is_geoban(self, channame):
+        return self.chan_is(channame, "geoban", "ON")
+
+    def chan_is_captcha(self, channame):
+        return self.chan_is(channame, "captcha", "SOFT") or \
+               self.chan_is(channame, "captcha", "SECURE")
+
+    def chan_is_secure(self, channame):
+        return self.chan_is(channame, "captcha", "SECURE")
 
     def keepnick(self):
         if self.mynick != self.orignick:
@@ -99,6 +169,29 @@ class KABASBot(SingleServerIRCBot):
                 out.append(name)
         return out
                 
+    def hashkey(self, ident_host):
+        h = md5.new(ident_host)
+        return h.hexdigest()
+
+    def captcha_url(self, user_key):
+        return self.settings.captcha_url + "/?key=" + user_key
+
+    def is_valid_ip(self, ip):
+        if ip.count('.') == 3:
+            try:
+                socket.inet_pton(socket.AF_INET, ip)
+            except socket.error:
+                return False
+        else:
+            try:
+                socket.inet_pton(socket.AF_INET6, ip)
+            except socket.error:
+                return False
+        return True
+
+    def is_banned_country(self, cc):
+        return cc in self.settings.banned_countries
+
     #### Post-Event Calls ####
     def hook_solved_captcha(self, nick, ident_host):
         LOG.debug("Hook hook_solved_captcha")
@@ -110,7 +203,8 @@ class KABASBot(SingleServerIRCBot):
         db = self.db
         db.update_exception(ident_host)
         chan = self.channels[channame]
-        if chan.is_oper(self.mynick) and \
+        if self.chan_is_autovoice(channame) and \
+           chan.is_oper(self.mynick) and \
            not chan.is_voiced(nick):
             LOG.info("Voicing %s in %s", nick, channame)
             self.connection.mode(channame, "+v %s" % nick)
@@ -153,31 +247,48 @@ class KABASBot(SingleServerIRCBot):
 
     def hook_ip_lookup_chan(self, c, ui):
         LOG.debug("Hook hook_ip_lookup_chan")
+        if not self.chan_is_geoban(ui.chan):
+            return
+        geodb = self.geodb
+        geo = geodb.lookup(ui.ip)
+        if geo:
+            cc = geo["cc"]
+            LOG.info("IP lookup: %s!%s@%s(%s) %s country_code:%s", ui.nick,
+                      ui.ident, ui.host, ui.ip, ui.chan, cc)
+            if is_banned_country(cc):
+                LOG.info("Banned country %s: %s!%s@%s(%s) from %s", cc, ui.nick,
+                         ui.ident, ui.host, ui.ip, ui.chan)
+                c.mode(ui.chan, "+b *!*@%s" % ui.host)
+                c.kick(ui.chan, ui.nick, "Banned country: %s" % cc)
 
     def hook_control_msg(self, c, e, argv, reply):
         LOG.debug("Hook hook_control_privmsg")
         if len(argv) < 2:
             return
         cmd = argv[1]
-        if cmd == "seclevel":
-            if len(argv) < 3:
+        if cmd == "set":
+            if len(argv) < 5:
                 return
-            seclevel = argv[2].upper()
-            if seclevel in [ "OFF", "SOFT", "SECURE" ]:
-                self.seclevel = seclevel
-                c.privmsg(reply, "KABASBot level set to %s" % seclevel)
+            channame = argv[2]
+            param = argv[3]
+            value = argv[4]
+            if param not in self.settings.chanconfig[channame]:
+                return
+            self.settings.chanconfig[channame][param] = value.upper()
+            c.privmsg(reply, "set %s %s = %s" % (channame, param, value))
             else:
                 c.privmsg(reply, "Error, unknown level %s" % seclevel)
         elif cmd == "join":
             if len(argv) < 3:
                 return
-            channame = argv[2].upper()
+            channame = argv[2]
+            self.settings.add_channel(channame)
             c.privmsg(reply, "Joining channel %s" % channame)
             c.join(channame)
         elif cmd == "part":
             if len(argv) < 3:
                 return
-            channame = argv[2].upper()
+            channame = argv[2]
             c.privmsg(reply, "Parting channel %s" % channame)
             c.part(channame)
 
@@ -191,7 +302,7 @@ class KABASBot(SingleServerIRCBot):
                 userinfo = chan._users[nick]
                 if not isinstance(userinfo, UserInfo):
                     # not really an error
-                    LOG.info("UserInfo for %s not found. Creating", nick)
+                    LOG.error("UserInfo for %s not found. Creating", nick)
                     userinfo = UserInfo(nick)
                     chan._users[nick] = userinfo
                 out.append(userinfo)
@@ -199,16 +310,16 @@ class KABASBot(SingleServerIRCBot):
 
     #### Events #### 
     def on_pubmsg(self, c, e):
-        LOG.info("EVENT %s", e)
-        if e.target.lower() == settings["chancontrol"].lower():
+        LOG.debug("EVENT %s", e)
+        if e.target.lower() == self.settings.chancontrol.lower():
             argv = e.arguments[0].split(" ")
             if argv[0] == ".cmd":
                 reply = e.target
                 self.hook_control_msg(c, e, argv, reply)
 
     def on_privmsg(self, c, e):
-        LOG.info("EVENT %s", e)
-        for mask in settings["users"]:
+        LOG.debug("EVENT %s", e)
+        for mask in self.settings.users:
             if re.match(mask, e.source):
                 argv = e.arguments[0].split(" ")
                 if argv[0] == ".cmd":
@@ -218,8 +329,9 @@ class KABASBot(SingleServerIRCBot):
     def get_version(self):
         return 'KABASBot 0.1'
 
+    # USERINFO response with IP
     def on_338(self, c, e):
-        LOG.info("EVENT %s", e)
+        LOG.debug("EVENT %s", e)
         if len(e.arguments) < 2:
             return
         nick = e.arguments[0]
@@ -236,10 +348,10 @@ class KABASBot(SingleServerIRCBot):
         if nick == self.mynick:
             # Ignore the bot
             return
-        if e.target == settings["chancontrol"]:
+        if e.target == self.settings.chancontrol:
             # Don't parse joins for the control chan
             return
-        LOG.info("EVENT %s", e)
+        LOG.debug("EVENT %s", e)
         ident, host = e.source.split('@')
         chan = self.channels[e.target]
         userinfo = UserInfo(nick, ident, host, chan = e.target)
@@ -251,7 +363,7 @@ class KABASBot(SingleServerIRCBot):
             self.hook_join_not_excepted(c, e, nick, ident_host)
 
     def on_nick(self, c, e):
-        LOG.info("EVENT %s", e)
+        LOG.debug("EVENT %s", e)
         if e.source.nick == self.mynick:
             LOG.debug("My nick changed! Updating")
             self.mynick = e.target
@@ -264,34 +376,15 @@ class KABASBot(SingleServerIRCBot):
 
     def on_welcome(self, c, e):
         self.initialized = True
-        for channel in self.chanlist:
+        for channel in self.settings.chanconfig.keys():
             LOG.info("Joining channel %s", channel)
             c.join(channel)
 
     def on_disconnect(self, c, e):
         self.initialized = False
 
-# default config values. DO NOT CHANGE
-settings = {
-    'bindaddr': '0.0.0.0',
-    'captcha_url': None,
-    'chancontrol': None,
-    'chanlist': [],
-    'db_host': None,
-    'db_name': None,
-    'db_pass': None,
-    'db_user': None,
-    'ipv6': False,
-    'msgcontrol': False,
-    'nickname': None,
-    'seclevel': "OFF",
-    'servers': [],
-    'ssl': False,
-    'users': []
-}
-
 if __name__ == '__main__':
-    LOG = logging.getLogger('captcha-irc')
+    LOG = logging.getLogger('kabasbot-irc')
     LOG.setLevel(logging.DEBUG)
     logging.basicConfig(level=logging.DEBUG)
     handler = RotatingFileHandler(
@@ -307,21 +400,17 @@ if __name__ == '__main__':
     ROOTLOG = logging.getLogger()
     ROOTLOG.addHandler(handler)
 
-    settings.update(json.load(open("captcha-irc.cfg", 'r')))
-    LOG.info("Loaded settings")
-
     if settings["ssl"]:
         wrapper = ssl.wrap_socket
     else:
         wrapper = connection.identity
 
+    settings = KABASConfig("kabasbot-irc.cfg")
     bot = KABASBot(
-        server_list = settings["servers"],
-        nickname = settings["nickname"],
-        chanlist = settings["chanlist"],
+        settings = settings,
         connect_factory = connection.Factory(
-            bind_address = (settings["bindaddr"],0),
-            ipv6 = settings["ipv6"],
+            bind_address = (settings.bindaddr,0),
+            ipv6 = settings.ipv6,
             wrapper = wrapper))
     bot.start()
         

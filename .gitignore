@@ -1,5 +1,5 @@
-captchabot-irc.cfg
-captchabot-web.cfg
+kabasbot-irc.cfg
+kabasbot-web.cfg
 geoip/*
 *.pyc
 *.swp
