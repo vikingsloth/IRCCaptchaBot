@@ -75,7 +75,7 @@ class CaptchaDB(object):
     def is_excepted(self, ident_host):
         c = self.cursor
         c.execute("SELECT 1 FROM exceptions WHERE ident_host = %s LIMIT 1",
-                  (ident_host))
+                  (ident_host,))
         if c.rowcount > 0:
             c.fetchall()
             return True

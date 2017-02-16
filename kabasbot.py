@@ -349,15 +349,13 @@ class KABASBot(SingleServerIRCBot):
         if self.is_valid_ip(ip):
             geodb = self.geodb
             cc = geodb.lookup(ip)
+            if reply:
+                c.privmsg(reply, "GeoIP: cc=%s %s@%s" % (cc, nick, ip))
+            LOG.info("GeoIP: cc=%s %s@%s", cc, nick, ip)
             for ui in self.get_userinfos(nick):
                 # Find the user in all channels being tracked and updated ui
                 ui.ip = ip
                 ui.cc = cc
-                if reply:
-                    c.privmsg(reply, "GeoIP: cc=%s chan=%s %s(%s)" %
-                              (cc, ui.chan, ui.get_usermask(), ip))
-                LOG.info("GeoIP: cc=%s chan=%s %s(%s)", cc, ui.chan,
-                         ui.get_usermask(), ip)
                 self.hook_ip_lookup_chan(c, ui)
         else:
             LOG.error("GeoIP: Unable to determine IP from whois. "
