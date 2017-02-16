@@ -3,7 +3,7 @@
 import MySQLdb
 import logging
 from logging.handlers import RotatingFileHandler
-from irc.bot import Channel, SingleServerIRCBot
+from irc.bot import Channel, SingleServerIRCBot, ServerSpec
 from irc import connection
 import md5
 import socket
@@ -24,8 +24,12 @@ class UserInfo(object):
         self.chan = chan
         self.mynick = nick
 
+    def get_usermask(self):
+        return str(self.nick) + "!" + str(self.ident) + "@" + str(self.host)
+
     def set_ip(self, ip):
         self.ip = ip
+
 
 class KABASConfig(object):
     DEFAULTS = {
@@ -33,7 +37,6 @@ class KABASConfig(object):
         'captcha_url': None,
         'chancontrol': None,
         'channels': {},
-        'password': None,
         'db_host': None,
         'db_name': None,
         'db_pass': None,
@@ -41,7 +44,6 @@ class KABASConfig(object):
         'ipv6': False,
         'msgcontrol': False,
         'nickname': None,
-        'servers': [],
         'ssl': False,
         'users': [],
         'banned_countries': []
@@ -56,11 +58,11 @@ class KABASConfig(object):
     def init_from_dict(self, settings):
         s = self.DEFAULTS
         s.update(settings)
+        self.chanconfig = {}
         self.add_channels(s["channels"])
         self.bindaddr = s["bindaddr"]
         self.captcha_url = s["captcha_url"]
         self.chancontrol = s["chancontrol"]
-        self.password = s["chancontrol"]
         self.db_host = s["db_host"]
         self.db_name = s["db_name"]
         self.db_pass = s["db_pass"]
@@ -68,10 +70,15 @@ class KABASConfig(object):
         self.ipv6 = s["ipv6"]
         self.msgcontrol = s["msgcontrol"]
         self.nickname = s["nickname"]
-        self.servers = s["servers"]
+        self.servers = []
+        self.add_servers(s["servers"])
         self.ssl = s["ssl"]
         self.users = s["users"]
         self.banned_countries = s["banned_countries"]
+
+    def add_servers(self, servers):
+        for server_config in servers:
+            self.servers.append(ServerSpec(*server_config))
 
     def add_channel(self, name, captcha = "OFF", geoban = "OFF",
                     autovoice = "OFF"):
@@ -91,10 +98,8 @@ class KABASBot(SingleServerIRCBot):
 
     def __init__(self, settings, **connect_params):
         self.settings = settings
-        server_list = settings.servers
-        nickname = settings.nickname
         super(KABASBot, self).__init__(
-            server_list, nickname, "KABAS Bot", **connect_params)
+            settings.servers, settings.nickname, "KABAS Bot", **connect_params)
         self.db = CaptchaDB(
                 settings.db_host,
                 settings.db_user,
@@ -106,6 +111,7 @@ class KABASBot(SingleServerIRCBot):
         self.mynick = settings.nickname
         self.orignick = settings.nickname
         self.geodb = GeoIP()
+        self.geocheck = {}
         self.initialized = False
 
     def check_solved_captchas(self):
@@ -219,7 +225,7 @@ class KABASBot(SingleServerIRCBot):
         chan = self.channels[e.target]
         ui = chan._users[nick]
         host = ui.host
-        if is_valid_ip(host):
+        if self.is_valid_ip(host):
             ui.ip = host
             self.hook_ip_lookup_chan(c, ui)
         else:
@@ -227,7 +233,7 @@ class KABASBot(SingleServerIRCBot):
             c.whois(nick)
         if self.seclevel != "OFF":
             LOG.info("Prompting %s!%s to solve captcha", nick, ident_host)
-            user_key = hashkey(ident_host)
+            user_key = self.hashkey(ident_host)
             try:
                 db.insert_captcha(user_key, ident_host, nick)
             except MySQLdb.IntegrityError:
@@ -243,52 +249,53 @@ class KABASBot(SingleServerIRCBot):
                       "Your hostmask %s has not been confirmed for access to "
                       "%s. Solve this captcha to confirm you're not a "
                       "bot: %s" %
-                      (ident_host, e.target, captcha_url(user_key)))
+                      (ident_host, e.target, self.captcha_url(user_key)))
 
     def hook_ip_lookup_chan(self, c, ui):
         LOG.debug("Hook hook_ip_lookup_chan")
         if not self.chan_is_geoban(ui.chan):
             return
-        geodb = self.geodb
-        geo = geodb.lookup(ui.ip)
-        if geo:
-            cc = geo["cc"]
-            LOG.info("IP lookup: %s!%s@%s(%s) %s country_code:%s", ui.nick,
-                      ui.ident, ui.host, ui.ip, ui.chan, cc)
-            if is_banned_country(cc):
-                LOG.info("Banned country %s: %s!%s@%s(%s) from %s", cc, ui.nick,
-                         ui.ident, ui.host, ui.ip, ui.chan)
-                c.mode(ui.chan, "+b *!*@%s" % ui.host)
-                c.kick(ui.chan, ui.nick, "Banned country: %s" % cc)
+        if self.is_banned_country(ui.cc):
+            LOG.info("Banned country %s: %s!%s@%s(%s) from %s", ui.cc, ui.nick,
+                     ui.ident, ui.host, ui.ip, ui.chan)
+            c.mode(ui.chan, "+b *!*@%s" % ui.host)
+            c.kick(ui.chan, ui.nick, "Banned country: %s" % ui.cc)
 
     def hook_control_msg(self, c, e, argv, reply):
         LOG.debug("Hook hook_control_privmsg")
         if len(argv) < 2:
             return
-        cmd = argv[1]
+        cmd = argv[0][1:]
         if cmd == "set":
-            if len(argv) < 5:
+            if len(argv) < 4:
                 return
-            channame = argv[2]
-            param = argv[3]
-            value = argv[4]
+            channame = argv[1]
+            param = argv[2]
+            value = argv[3]
             if param not in self.settings.chanconfig[channame]:
                 return
             self.settings.chanconfig[channame][param] = value.upper()
             c.privmsg(reply, "set %s %s = %s" % (channame, param, value))
         elif cmd == "join":
-            if len(argv) < 3:
+            if len(argv) < 2:
                 return
-            channame = argv[2]
+            channame = argv[1]
             self.settings.add_channel(channame)
             c.privmsg(reply, "Joining channel %s" % channame)
             c.join(channame)
         elif cmd == "part":
-            if len(argv) < 3:
+            if len(argv) < 2:
                 return
-            channame = argv[2]
+            channame = argv[1]
             c.privmsg(reply, "Parting channel %s" % channame)
             c.part(channame)
+        elif cmd == "check":
+            if len(argv) < 2:
+                return
+            nick = argv[1]
+            c.privmsg(reply, "Checking %s's IP" % nick)
+            c.whois(nick)
+            self.geocheck[nick] = reply
 
     #### Utils ####
     # Gets all the UserInfo classes from channels matching nick
@@ -311,7 +318,7 @@ class KABASBot(SingleServerIRCBot):
         LOG.debug("EVENT %s", e)
         if e.target.lower() == self.settings.chancontrol.lower():
             argv = e.arguments[0].split(" ")
-            if argv[0] == ".cmd":
+            if argv[0][0] == ".":
                 reply = e.target
                 self.hook_control_msg(c, e, argv, reply)
 
@@ -320,7 +327,8 @@ class KABASBot(SingleServerIRCBot):
         for mask in self.settings.users:
             if re.match(mask, e.source):
                 argv = e.arguments[0].split(" ")
-                if argv[0] == ".cmd":
+                # .cmd
+                if argv[0][0] == ".":
                     reply = e.source.nick
                     self.hook_control_msg(c, e, argv, reply)
 
@@ -334,12 +342,28 @@ class KABASBot(SingleServerIRCBot):
             return
         nick = e.arguments[0]
         ip = e.arguments[1]
-        if is_valid_ip(ip):
+        reply = None
+        if nick in self.geocheck:
+            # If this was a manual query find out where it came from
+            reply = self.geocheck.pop(nick)
+        if self.is_valid_ip(ip):
+            geodb = self.geodb
+            cc = geodb.lookup(ip)
             for ui in self.get_userinfos(nick):
+                # Find the user in all channels being tracked and updated ui
                 ui.ip = ip
+                ui.cc = cc
+                if reply:
+                    c.privmsg(reply, "GeoIP: cc=%s chan=%s %s(%s)" %
+                              (cc, ui.chan, ui.get_usermask(), ip))
+                LOG.info("GeoIP: cc=%s chan=%s %s(%s)", cc, ui.chan,
+                         ui.get_usermask(), ip)
                 self.hook_ip_lookup_chan(c, ui)
         else:
-            LOG.error("Unable to determine IP from whois. Try changing servers")
+            LOG.error("GeoIP: Unable to determine IP from whois. "
+                      "Try changing servers")
+            if reply:
+                c.privmsg(reply, "GeoIP: Unable to determine IP from whois")
 
     def on_join(self, c, e):
         nick, ident_host = e.source.split('!')

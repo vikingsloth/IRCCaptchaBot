@@ -25,7 +25,9 @@ class GeoIP(object):
     def lookup(self, ip):
         rnode = self.rtree.search_best(ip)
         if rnode:
-            return rnode.data
+            return rnode.data["cc"]
+        else:
+            return "unknown"
 
     def update_files(self):
         if not os.path.isdir(self.directory):
@@ -52,7 +54,6 @@ class GeoIP(object):
                 match = re.match("\d+\.\d+\.\d+\.\d+/\d+$", cidr)
                 if match:
                     rnode = newtree.add(cidr)
-                    rnode.data["hits"] = 0
                     rnode.data["cc"] = country_code
         LOG.info("Done loading files")
         self.rtree = newtree
