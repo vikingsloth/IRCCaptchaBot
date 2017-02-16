@@ -231,7 +231,7 @@ class KABASBot(SingleServerIRCBot):
         else:
             LOG.debug("Checking whois for IP user=%s", nick)
             c.whois(nick)
-        if self.seclevel != "OFF":
+        if self.chan_is_captcha(chan):
             LOG.info("Prompting %s!%s to solve captcha", nick, ident_host)
             user_key = self.hashkey(ident_host)
             try:
