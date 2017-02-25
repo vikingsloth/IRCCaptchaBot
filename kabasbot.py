@@ -4,7 +4,8 @@ import MySQLdb
 import logging
 from logging.handlers import RotatingFileHandler
 from irc.bot import Channel, SingleServerIRCBot, ServerSpec
-from irc import connection
+from irc import connection, client
+from jaraco.stream.buffer import LenientDecodingLineBuffer
 import md5
 import socket
 import json
@@ -14,17 +15,24 @@ import re
 from captcha import CaptchaDB
 from geoip import GeoIP
 
+# irc.client workaround for decoding failures on UTF8
+client.ServerConnection.buffer_class = LenientDecodingLineBuffer
+
 class UserInfo(object):
 
-    def __init__(self, nick, ident = None, host = None, chan = None, ip = None):
+    def __init__(self, chan, nick, ident = None, host = None, ip = None,
+                 server = None, cc = None, real_name = None):
         self.nick = nick
         self.ident = ident
         self.host = host
         self.ip = ip
         self.chan = chan
+        self.server = server
+        self.cc = cc
+        self.real_name = real_name
         self.mynick = nick
 
-    def get_usermask(self):
+    def userhost(self):
         return str(self.nick) + "!" + str(self.ident) + "@" + str(self.host)
 
     def set_ip(self, ip):
@@ -35,7 +43,7 @@ class KABASConfig(object):
     DEFAULTS = {
         'bindaddr': '0.0.0.0',
         'captcha_url': None,
-        'chancontrol': None,
+        'statuschan': None,
         'channels': {},
         'db_host': None,
         'db_name': None,
@@ -62,7 +70,7 @@ class KABASConfig(object):
         self.add_channels(s["channels"])
         self.bindaddr = s["bindaddr"]
         self.captcha_url = s["captcha_url"]
-        self.chancontrol = s["chancontrol"]
+        self.statuschan = s["statuschan"]
         self.db_host = s["db_host"]
         self.db_name = s["db_name"]
         self.db_pass = s["db_pass"]
@@ -75,6 +83,10 @@ class KABASConfig(object):
         self.ssl = s["ssl"]
         self.users = s["users"]
         self.banned_countries = s["banned_countries"]
+        
+        # Normalize country codes
+        for i in range(len(self.banned_countries)):
+            self.banned_countries[i] = self.banned_countries[i].lower()
 
     def add_servers(self, servers):
         for server_config in servers:
@@ -83,11 +95,11 @@ class KABASConfig(object):
     def add_channel(self, name, captcha = "OFF", geoban = "OFF",
                     autovoice = "OFF"):
         config = {
-            "captcha": captcha.upper(),
-            "geoban": geoban.upper(),
-            "autovoice": autovoice.upper()
+            "captcha": captcha.lower(),
+            "geoban": geoban.lower(),
+            "autovoice": autovoice.lower()
         }
-        self.chanconfig[name] = config
+        self.chanconfig[name.lower()] = config
 
     def add_channels(self, chanconfig):
         for name,config in chanconfig.iteritems():
@@ -135,8 +147,8 @@ class KABASBot(SingleServerIRCBot):
         if not key in chanconfig:
             return False
         state = chanconfig[key]
-        # state is already upper()
-        if state == value.upper():
+        # state is already lower()
+        if state == value.lower():
             return True
         else:
             return False
@@ -196,7 +208,51 @@ class KABASBot(SingleServerIRCBot):
         return True
 
     def is_banned_country(self, cc):
-        return cc in self.settings.banned_countries
+        if not cc:
+            return False
+        return cc.lower() in self.settings.banned_countries
+
+    def status_msg(self, msg):
+        chan = self.settings.statuschan
+        c = self.connection
+        if not chan:
+            return
+        c.privmsg(chan, msg)
+
+    # Update userinfo with arguments. Note that channel is not available here
+    # because there is one userinfo class per channel and is set at the time
+    # of creation
+    def update_userinfo(self, nick, ident = None, host = None, ip = None,
+                        server = None, cc = None, real_name = None):
+        for ui in self.get_userinfos(nick):
+            # Find the user in all channels being tracked and updated ui
+            if ident:
+                ui.ident = ident
+            if host:
+                ui.host = host
+            if ip:
+                ui.ip = ip
+            if real_name:
+                ui.real_name = real_name
+            if cc:
+                ui.cc = cc
+            if ip and cc:
+                self.hook_ip_lookup_chan(self.connection, ui)
+
+    # Gets all the UserInfo classes from channels matching nick
+    def get_userinfos(self, nick):
+        out = []
+        for name in self.channels:
+            chan = self.channels[name]
+            if nick in chan._users:
+                userinfo = chan._users[nick]
+                if not isinstance(userinfo, UserInfo):
+                    # not really an error
+                    LOG.error("UserInfo for %s not found. Creating", nick)
+                    userinfo = UserInfo(name, nick)
+                    chan._users[nick] = userinfo
+                out.append(userinfo)
+        return out
 
     #### Post-Event Calls ####
     def hook_solved_captcha(self, nick, ident_host):
@@ -226,12 +282,17 @@ class KABASBot(SingleServerIRCBot):
         ui = chan._users[nick]
         host = ui.host
         if self.is_valid_ip(host):
+            # Host is already an IP. Don't whois it
             ui.ip = host
+            geodb = self.geodb
+            cc = geodb.lookup(host)
+            ui.cc = cc
             self.hook_ip_lookup_chan(c, ui)
         else:
             LOG.debug("Checking whois for IP user=%s", nick)
             c.whois(nick)
         if self.chan_is_captcha(chan):
+            # Channel setting has captcha prompting enabled
             LOG.info("Prompting %s!%s to solve captcha", nick, ident_host)
             user_key = self.hashkey(ident_host)
             try:
@@ -254,12 +315,17 @@ class KABASBot(SingleServerIRCBot):
     def hook_ip_lookup_chan(self, c, ui):
         LOG.debug("Hook hook_ip_lookup_chan")
         if not self.chan_is_geoban(ui.chan):
+            LOG.debug("Skipping geoban check for %s %s", ui.nick, ui.chan)
             return
         if self.is_banned_country(ui.cc):
-            LOG.info("Banned country %s: %s!%s@%s(%s) from %s", ui.cc, ui.nick,
-                     ui.ident, ui.host, ui.ip, ui.chan)
+            msg = "Banned country %s: %s!%s@%s(%s) from %s" % (ui.cc, ui.nick,
+                    ui.ident, ui.host, ui.ip, ui.chan)
+            LOG.info(msg)
+            self.status_msg(msg)
             c.mode(ui.chan, "+b *!*@%s" % ui.host)
             c.kick(ui.chan, ui.nick, "Banned country: %s" % ui.cc)
+            c.privmsg(ui.chan, "Banned country: %s (%s) %s" %
+                      (ui.cc, ui.ip, ui.userhost()))
 
     def hook_control_msg(self, c, e, argv, reply):
         LOG.debug("Hook hook_control_privmsg")
@@ -274,7 +340,7 @@ class KABASBot(SingleServerIRCBot):
             value = argv[3]
             if param not in self.settings.chanconfig[channame]:
                 return
-            self.settings.chanconfig[channame][param] = value.upper()
+            self.settings.chanconfig[channame][param] = value.lower()
             c.privmsg(reply, "set %s %s = %s" % (channame, param, value))
         elif cmd == "join":
             if len(argv) < 2:
@@ -296,34 +362,31 @@ class KABASBot(SingleServerIRCBot):
             c.privmsg(reply, "Checking %s's IP" % nick)
             c.whois(nick)
             self.geocheck[nick] = reply
-
-    #### Utils ####
-    # Gets all the UserInfo classes from channels matching nick
-    def get_userinfos(self, nick):
-        out = []
-        for name in self.channels:
+        elif cmd == "chancheck":
+            if len(argv) < 2:
+                return
+            name = argv[1]
+            if name not in self.channels:
+                c.privmsg(reply, "Unknown channel %s", chan)
             chan = self.channels[name]
-            if nick in chan._users:
-                userinfo = chan._users[nick]
-                if not isinstance(userinfo, UserInfo):
-                    # not really an error
-                    LOG.error("UserInfo for %s not found. Creating", nick)
-                    userinfo = UserInfo(nick)
-                    chan._users[nick] = userinfo
-                out.append(userinfo)
-        return out
+            towhois = []
+            for nick,ui in chan._users.iteritems():
+                if isinstance(ui, UserInfo) and ui.ip and ui.cc:
+                    # Skip user we already checked
+                    continue
+                towhois.append(nick)
+            c.privmsg(reply, "Whois %s: %d users missing userinfo out of %d" %
+                      (name, len(towhois), len(chan._users)))
+            for nick in towhois:
+                c.whois(nick)
+            c.privmsg(reply, "Whois %s: completed" % name)
+
 
     #### Events #### 
     def on_pubmsg(self, c, e):
-        LOG.debug("EVENT %s", e)
-        if e.target.lower() == self.settings.chancontrol.lower():
-            argv = e.arguments[0].split(" ")
-            if argv[0][0] == ".":
-                reply = e.target
-                self.hook_control_msg(c, e, argv, reply)
+        pass
 
     def on_privmsg(self, c, e):
-        LOG.debug("EVENT %s", e)
         for mask in self.settings.users:
             if re.match(mask, e.source):
                 argv = e.arguments[0].split(" ")
@@ -335,10 +398,10 @@ class KABASBot(SingleServerIRCBot):
     def get_version(self):
         return 'KABASBot 0.1'
 
-    # USERINFO response with IP
+    # WHOIS IP
     def on_338(self, c, e):
-        LOG.debug("EVENT %s", e)
         if len(e.arguments) < 2:
+            LOG.debug("Protocol error parsing whois: %s", e)
             return
         nick = e.arguments[0]
         ip = e.arguments[1]
@@ -349,32 +412,54 @@ class KABASBot(SingleServerIRCBot):
         if self.is_valid_ip(ip):
             geodb = self.geodb
             cc = geodb.lookup(ip)
+            msg = "GeoIP: cc=%s %s@%s" % (cc, nick, ip)
+            self.status_msg(msg)
+            LOG.info(msg)
             if reply:
-                c.privmsg(reply, "GeoIP: cc=%s %s@%s" % (cc, nick, ip))
-            LOG.info("GeoIP: cc=%s %s@%s", cc, nick, ip)
-            for ui in self.get_userinfos(nick):
-                # Find the user in all channels being tracked and updated ui
-                ui.ip = ip
-                ui.cc = cc
-                self.hook_ip_lookup_chan(c, ui)
+                # Lookup request came from command. Reply to sender
+                c.privmsg(reply, msg)
+            self.update_userinfo(nick, ip = ip, cc = cc)
         else:
             LOG.error("GeoIP: Unable to determine IP from whois. "
                       "Try changing servers")
             if reply:
                 c.privmsg(reply, "GeoIP: Unable to determine IP from whois")
 
+    # WHOIS Server
+    def on_whoisserver(self, c, e):
+        # nick, server, server description
+        if len(e.arguments) < 2:
+            LOG.debug("Protocol error parsing whois: %s", e)
+            return
+        nick = e.arguments[0]
+        server = e.arguments[1]
+        self.update_userinfo(nick, server = server)
+
+    # WHOIS User
+    def on_whoisuser(self, c, e):
+        # nick, ident, host, *, real_name
+        if len(e.arguments) < 5:
+            LOG.debug("Protocol error parsing whois: %s", e)
+            return
+        nick = e.arguments[0]
+        ident = e.arguments[1]
+        host = e.arguments[2]
+        real_name = e.arguments[4]
+        self.update_userinfo(nick, ident = ident, host = host,
+                             real_name = real_name)
+
     def on_join(self, c, e):
         nick, ident_host = e.source.split('!')
         if nick == self.mynick:
             # Ignore the bot
             return
-        if e.target == self.settings.chancontrol:
-            # Don't parse joins for the control chan
+        if e.target == self.settings.statuschan:
+            # Don't parse joins for the status chan
             return
         LOG.debug("EVENT %s", e)
         ident, host = e.source.split('@')
         chan = self.channels[e.target]
-        userinfo = UserInfo(nick, ident, host, chan = e.target)
+        userinfo = UserInfo(e.target, nick, ident, host)
         chan.set_userdetails(nick, userinfo)
         db = self.db
         if db.is_excepted(ident_host):
@@ -383,7 +468,6 @@ class KABASBot(SingleServerIRCBot):
             self.hook_join_not_excepted(c, e, nick, ident_host)
 
     def on_nick(self, c, e):
-        LOG.debug("EVENT %s", e)
         if e.source.nick == self.mynick:
             LOG.debug("My nick changed! Updating")
             self.mynick = e.target

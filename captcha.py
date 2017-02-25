@@ -63,7 +63,7 @@ class CaptchaDB(object):
     def update_exception(self, ident_host):
         c = self.cursor
         c.execute("UPDATE exceptions SET last = NOW() WHERE ident_host = %s",
-                  (ident_host))
+                  (ident_host,))
         self.db.commit()
 
     def add_exception(self, ident_host, user_key):
