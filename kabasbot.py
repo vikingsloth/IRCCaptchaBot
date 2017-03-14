@@ -141,6 +141,7 @@ class KABASBot(SingleServerIRCBot):
 
     #### Utility functions
     def chan_is(self, channame, key, value):
+        channame = channame.lower()
         if not channame in self.settings.chanconfig:
             return False
         chanconfig = self.settings.chanconfig[channame]
@@ -278,7 +279,8 @@ class KABASBot(SingleServerIRCBot):
     def hook_join_not_excepted(self, c, e, nick, ident_host):
         LOG.debug("Hook hook_join_not_excepted")
         db = self.db
-        chan = self.channels[e.target]
+        channame = e.target
+        chan = self.channels[channame]
         ui = chan._users[nick]
         host = ui.host
         if self.is_valid_ip(host):
@@ -287,11 +289,14 @@ class KABASBot(SingleServerIRCBot):
             geodb = self.geodb
             cc = geodb.lookup(host)
             ui.cc = cc
+            LOG.debug("Valid IP, skipping whois check for user=%s", nick)
+            msg = "GeoIP: cc=%s %s!%s %s" % (cc, nick, ident_host, channame)
+            self.status_msg(msg)
             self.hook_ip_lookup_chan(c, ui)
         else:
             LOG.debug("Checking whois for IP user=%s", nick)
             c.whois(nick)
-        if self.chan_is_captcha(chan):
+        if self.chan_is_captcha(channame):
             # Channel setting has captcha prompting enabled
             LOG.info("Prompting %s!%s to solve captcha", nick, ident_host)
             user_key = self.hashkey(ident_host)
@@ -412,7 +417,7 @@ class KABASBot(SingleServerIRCBot):
         if self.is_valid_ip(ip):
             geodb = self.geodb
             cc = geodb.lookup(ip)
-            msg = "GeoIP: cc=%s %s@%s" % (cc, nick, ip)
+            msg = "GeoIP: cc=%s %s!?@%s" % (cc, nick, ip)
             self.status_msg(msg)
             LOG.info(msg)
             if reply:
