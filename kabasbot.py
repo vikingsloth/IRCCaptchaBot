@@ -14,6 +14,7 @@ import re
 
 from captcha import CaptchaDB
 from geoip import GeoIP
+from dnsrbl import DNS
 
 # irc.client workaround for decoding failures on UTF8
 client.ServerConnection.buffer_class = LenientDecodingLineBuffer
@@ -54,7 +55,8 @@ class KABASConfig(object):
         'nickname': None,
         'ssl': False,
         'users': [],
-        'banned_countries': []
+        'banned_countries': [],
+        'dnsbl': []
     }
 
     def __init__(self, filename = None, settings = None):
@@ -83,6 +85,7 @@ class KABASConfig(object):
         self.ssl = s["ssl"]
         self.users = s["users"]
         self.banned_countries = s["banned_countries"]
+        self.dnsrbl = s["dnsrbl"]
         
         # Normalize country codes
         for i in range(len(self.banned_countries)):
@@ -93,11 +96,12 @@ class KABASConfig(object):
             self.servers.append(ServerSpec(*server_config))
 
     def add_channel(self, name, captcha = "OFF", geoban = "OFF",
-                    autovoice = "OFF"):
+                    autovoice = "OFF", dnsrbl = "OFF"):
         config = {
             "captcha": captcha.lower(),
             "geoban": geoban.lower(),
-            "autovoice": autovoice.lower()
+            "autovoice": autovoice.lower(),
+            "dnsrbl": dnsrbl.lower()
         }
         self.chanconfig[name.lower()] = config
 
@@ -118,15 +122,20 @@ class KABASBot(SingleServerIRCBot):
                 settings.db_pass,
                 settings.db_name)
         self.db.connect()
-        self.reactor.execute_every(2, self.periodic_callback)
+        self.reactor.execute_every(1, self.periodic_callback)
+        self.reactor.execute_every(2, self.check_solved_captchas)
         self.reactor.execute_every(10, self.keepnick)
         self.mynick = settings.nickname
         self.orignick = settings.nickname
         self.geodb = GeoIP()
         self.geocheck = {}
+        self.dns = DNS()
         self.initialized = False
 
+    #### Periodic functions
     def check_solved_captchas(self):
+        if not self.initialized:
+            return
         rows = self.db.archive_solved_captchas()
         for row in rows:
             ident_host = row[1]
@@ -135,9 +144,15 @@ class KABASBot(SingleServerIRCBot):
             LOG.info("Solved captcha: %s %s", nick, ip)
             self.hook_solved_captcha(nick, ident_host)
 
+    def check_dns_results(self):
+        count = self.dns.processAnswers()
+        LOG.debug("Finished %d/%d DNS queries" %
+                  (count, count + self.dns.qlen()))
+
     def periodic_callback(self):
-        if self.initialized:
-            self.check_solved_captchas()
+        if not self.initialized:
+            return
+        self.check_dns_results()
 
     #### Utility functions
     def chan_is(self, channame, key, value):
@@ -153,6 +168,9 @@ class KABASBot(SingleServerIRCBot):
             return True
         else:
             return False
+
+    def chan_is_dnsrbl(self, channame):
+        return self.chan_is(channame, "dnsrbl", "ON")
 
     def chan_is_autovoice(self, channame):
         return self.chan_is(channame, "autovoice", "ON")
@@ -213,6 +231,13 @@ class KABASBot(SingleServerIRCBot):
             return False
         return cc.lower() in self.settings.banned_countries
 
+    def nick_in_chan(self, channame, nick):
+        if channame in self.channels:
+            chan = self.channels[channame]
+            if nick in chan._users:
+                return True
+        return False
+
     def status_msg(self, msg):
         chan = self.settings.statuschan
         c = self.connection
@@ -256,6 +281,28 @@ class KABASBot(SingleServerIRCBot):
         return out
 
     #### Post-Event Calls ####
+    def hook_dnsrbl_lookup(self, nick, channame, ip):
+        LOG.debug("Hook hook_dnsrbl_lookup")
+        parts = ip.split(".")
+        parts.reverse()
+        rev = ".".join(parts)
+        for dnsrbl in self.settings.dnsrbl:
+            args = [dnsrbl, nick, channame, ip]
+            qname = rev + "." + dnsrbl
+            LOG.debug("DNS query %s", qname)
+            self.dns.host(qname, self.hook_dnsrbl_answer, *args)
+
+    def hook_dnsrbl_answer(self, answer, rbl, nick, channame, ip):
+        LOG.debug("Hook hook_dnsrbl_answer")
+        msg = "DNSRBL %s: %s %s %s" % (rbl, ip, nick, channame)
+        LOG.info(msg)
+        if not self.nick_in_chan(channame, nick):
+            return
+        c = self.connection
+        c.mode(channame, "+b *!*@%s" % ip)
+        c.kick(channame, nick, "Banned IP: %s" % rbl)
+        c.privmsg(channame, "Banned IP: %s (%s) %s" % (nick, ip, rbl))
+
     def hook_solved_captcha(self, nick, ident_host):
         LOG.debug("Hook hook_solved_captcha")
         for chan in self.get_user_chans(nick):
@@ -321,8 +368,7 @@ class KABASBot(SingleServerIRCBot):
         LOG.debug("Hook hook_ip_lookup_chan")
         if not self.chan_is_geoban(ui.chan):
             LOG.debug("Skipping geoban check for %s %s", ui.nick, ui.chan)
-            return
-        if self.is_banned_country(ui.cc):
+        elif self.is_banned_country(ui.cc):
             msg = "Banned country %s: %s!%s@%s(%s) from %s" % (ui.cc, ui.nick,
                     ui.ident, ui.host, ui.ip, ui.chan)
             LOG.info(msg)
@@ -331,6 +377,8 @@ class KABASBot(SingleServerIRCBot):
             c.kick(ui.chan, ui.nick, "Banned country: %s" % ui.cc)
             c.privmsg(ui.chan, "Banned country: %s (%s) %s" %
                       (ui.cc, ui.ip, ui.userhost()))
+        elif self.chan_is_dnsrbl(ui.chan):
+            self.hook_dnsrbl_lookup(ui.nick, ui.chan, ui.ip)
 
     def hook_control_msg(self, c, e, argv, reply):
         LOG.debug("Hook hook_control_privmsg")
