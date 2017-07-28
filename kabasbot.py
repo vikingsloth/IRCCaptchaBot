@@ -283,19 +283,27 @@ class KABASBot(SingleServerIRCBot):
     #### Post-Event Calls ####
     def hook_dnsrbl_lookup(self, nick, channame, ip):
         LOG.debug("Hook hook_dnsrbl_lookup")
+        if ip.find(":") != -1:
+            # ipv6 address not supported
+            LOG.debug("ipv6 not supported in DNSRBL yet")
+            return
         parts = ip.split(".")
         parts.reverse()
         rev = ".".join(parts)
-        for dnsrbl in self.settings.dnsrbl:
-            args = [dnsrbl, nick, channame, ip]
+        for dnsrbl,blocks in self.settings.dnsrbl.iteritems():
+            args = [dnsrbl, blocks, nick, channame, ip]
             qname = rev + "." + dnsrbl
             LOG.debug("DNS query %s", qname)
             self.dns.host(qname, self.hook_dnsrbl_answer, *args)
 
-    def hook_dnsrbl_answer(self, answer, rbl, nick, channame, ip):
+    def hook_dnsrbl_answer(self, answer, rbl, blocks, nick, channame, ip):
         LOG.debug("Hook hook_dnsrbl_answer")
-        msg = "DNSRBL %s: %s %s %s" % (rbl, ip, nick, channame)
+        msg = "DNSRBL %s: %s %s %s: %s" % (rbl, ip, nick, channame,
+                                           answer.rrset.items)
         LOG.info(msg)
+        if not self.dns.is_blacklisted(answer, blocks):
+            LOG.debug("DNSRBL %s: hit but did not match blocks", rbl)
+            return
         if not self.nick_in_chan(channame, nick):
             return
         c = self.connection

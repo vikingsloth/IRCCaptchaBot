@@ -2,6 +2,7 @@ from concurrent.futures import ProcessPoolExecutor
 import dns
 from dns import resolver
 import logging
+import re
 
 LOG = logging.getLogger('DNS')
 
@@ -44,3 +45,22 @@ class DNS(object):
                 unfinished.append(item)
         self.queue = unfinished
         return count
+
+    # take a dns.answer and check if any of the rrset matches the list.
+    # list entries are the 4th octect of the address so [1,2] would match
+    # 127.0.0.1 and 127.0.0.2
+    @staticmethod
+    def is_blacklisted(answer, blocks):
+        if answer and not blocks:
+            # If a block list isn't supplied, block if we get any result
+            return True
+        for item in answer.rrset.items:
+            res = item.to_text()
+            if re.match("^127\.0\.0\.[0-9]", res):
+                parts = res.split(".")
+                code = int(parts[3])
+                if code in blocks:
+                    return True
+        return False
+
+            
